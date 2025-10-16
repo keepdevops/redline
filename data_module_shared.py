@@ -771,6 +771,103 @@ class DataSource:
             self.connection.close()
 
 
+class LazyFileLoader:
+    """Lazy file loader that processes files in batches to avoid memory issues"""
+    
+    def __init__(self, file_paths, batch_size=100):
+        self.file_paths = file_paths
+        self.batch_size = batch_size
+        self.current_batch = 0
+        self.total_files = len(file_paths)
+        
+    def get_batch_count(self):
+        """Get total number of batches needed"""
+        return (self.total_files + self.batch_size - 1) // self.batch_size
+        
+    def get_batch_files(self, batch_idx):
+        """Get file paths for a specific batch"""
+        start_idx = batch_idx * self.batch_size
+        end_idx = min(start_idx + self.batch_size, self.total_files)
+        return self.file_paths[start_idx:end_idx]
+        
+    def process_batch(self, batch_idx, output_db_path, input_format='txt', progress_callback=None):
+        """Process one batch of files and append to DuckDB"""
+        batch_files = self.get_batch_files(batch_idx)
+        batch_df_list = []
+        
+        for idx, file_path in enumerate(batch_files):
+            try:
+                # Read the raw data
+                df = pd.read_csv(file_path)
+                
+                # If input format is txt (Stooq), standardize the columns
+                if input_format.lower() == 'txt':
+                    # Create a temporary DataLoader instance to use the standardize method
+                    temp_loader = DataLoader()
+                    df = temp_loader._standardize_txt_columns(df)
+                
+                if df is not None and not df.empty:
+                    batch_df_list.append(df)
+                    
+                # Update progress for this batch
+                if progress_callback:
+                    file_progress = (idx + 1) / len(batch_files)
+                    progress_callback(batch_idx, file_progress)
+                    
+            except Exception as error:
+                logging.error(f"Error processing file {file_path}: {str(error)}")
+                print(f"Failed to process {os.path.basename(file_path)}: {str(error)}")
+                continue
+        
+        # Combine batch dataframes
+        if batch_df_list:
+            batch_data = pd.concat(batch_df_list, ignore_index=True)
+            
+            # Initialize or append to DuckDB
+            if batch_idx == 0:
+                # First batch - create new table
+                conn = duckdb.connect(output_db_path)
+                conn.execute("DROP TABLE IF EXISTS tickers_data")
+                conn.execute("CREATE TABLE tickers_data AS SELECT * FROM batch_data")
+                conn.close()
+            else:
+                # Subsequent batches - append to existing table
+                conn = duckdb.connect(output_db_path)
+                conn.execute("INSERT INTO tickers_data SELECT * FROM batch_data")
+                conn.close()
+            
+            # Clear memory
+            del batch_data
+            del batch_df_list
+            
+        return len(batch_df_list) if batch_df_list else 0
+        
+    def process_all_batches(self, output_db_path, input_format='txt', progress_callback=None):
+        """Process all batches sequentially"""
+        total_batches = self.get_batch_count()
+        total_processed = 0
+        
+        print(f"Processing {self.total_files} files in {total_batches} batches...")
+        
+        for batch_idx in range(total_batches):
+            print(f"Processing batch {batch_idx + 1}/{total_batches}...")
+            
+            processed_count = self.process_batch(
+                batch_idx, 
+                output_db_path, 
+                input_format, 
+                progress_callback
+            )
+            
+            total_processed += processed_count
+            
+            if progress_callback:
+                progress_callback(batch_idx, 1.0)  # Batch complete
+                
+        print(f"Completed processing {total_processed} files successfully")
+        return total_processed
+
+
 class StockAnalyzerGUI:
     def __init__(self, root: tk.Tk, loader: DataLoader, connector: DatabaseConnector):
         self.root = root
@@ -1338,46 +1435,88 @@ class StockAnalyzerGUI:
                 self.run_in_main_thread(lambda *a, **k: self.progress_bar.pack())
                 self.run_in_main_thread(lambda *a, **k: self.progress_var.set(10))
                 
-                # Load and standardize data
-                dfs = []
-                for idx, file_path in enumerate(file_paths):
-                    try:
-                        # Read the raw data
-                        df = pd.read_csv(file_path)
+                # Check if we should use lazy loading for large datasets
+                if len(file_paths) > 50:  # Use lazy loading for more than 50 files
+                    print(f"Using lazy loading for {len(file_paths)} files...")
+                    
+                    # Create temporary DuckDB file for lazy processing
+                    temp_db_path = "temp_lazy_processing.duckdb"
+                    
+                    # Progress callback for lazy loading
+                    def lazy_progress_callback(batch_idx, file_progress):
+                        total_batches = lazy_loader.get_batch_count()
+                        batch_progress = (batch_idx / total_batches) * 40  # 40% for processing
+                        file_progress_in_batch = (file_progress / total_batches) * 40
+                        total_progress = 30 + batch_progress + file_progress_in_batch
+                        self.run_in_main_thread(lambda: self.progress_var.set(total_progress))
+                    
+                    # Create lazy loader
+                    lazy_loader = LazyFileLoader(file_paths, batch_size=100)
+                    
+                    # Process all batches
+                    total_processed = lazy_loader.process_all_batches(
+                        temp_db_path, 
+                        input_format, 
+                        lazy_progress_callback
+                    )
+                    
+                    if total_processed == 0:
+                        self.run_in_main_thread(lambda *a, **k: messagebox.showerror("Error", "No valid data loaded"))
+                        self.run_in_main_thread(lambda *a, **k: self.progress_bar.pack_forget())
+                        return
+                    
+                    # Load the processed data from DuckDB for further processing
+                    conn = duckdb.connect(temp_db_path)
+                    data = conn.execute("SELECT * FROM tickers_data").fetchdf()
+                    conn.close()
+                    
+                    # Clean up temporary file
+                    if os.path.exists(temp_db_path):
+                        os.remove(temp_db_path)
                         
-                        # If input format is txt (Stooq), standardize the columns
-                        if input_format.lower() == 'txt':
-                            df = self.loader._standardize_txt_columns(df)
-                        
-                        if df is not None and not df.empty:
-                            dfs.append(df)
-                        
-                        progress = 30 + (40 * (idx + 1) / len(file_paths))
-                        self.run_in_main_thread(lambda *a, **k: self.progress_var.set(progress))
-                        
-                    except Exception as error:
-                        logging.error(f"Error processing file {file_path}: {str(error)}")
-                        print(f"DEBUG: file_path={file_path} (type={type(file_path)})")
-                        if not isinstance(file_path, str):
-                            file_path_str = str(file_path)
-                        else:
-                            file_path_str = file_path
-                        self.run_in_main_thread(
-                            lambda error=error, file_path_str=file_path_str, *a, **k: (
-                                messagebox.showerror(
-                                    "Error",
-                                    f"Failed to process {os.path.basename(str(file_path_str)) if isinstance(file_path_str, (str, bytes, os.PathLike)) else file_path_str}: {str(error)}"
-                                )
-                            ))
-                        continue
-                
-                if not dfs:
-                    self.run_in_main_thread(lambda *a, **k: messagebox.showerror("Error", "No valid data loaded"))
-                    self.run_in_main_thread(lambda *a, **k: self.progress_bar.pack_forget())
-                    return
-                
-                # Combine all dataframes
-                data = pd.concat(dfs, ignore_index=True)
+                    print(f"Lazy loading completed: {total_processed} files processed")
+                    
+                else:
+                    # Use original method for small datasets
+                    dfs = []
+                    for idx, file_path in enumerate(file_paths):
+                        try:
+                            # Read the raw data
+                            df = pd.read_csv(file_path)
+                            
+                            # If input format is txt (Stooq), standardize the columns
+                            if input_format.lower() == 'txt':
+                                df = self.loader._standardize_txt_columns(df)
+                            
+                            if df is not None and not df.empty:
+                                dfs.append(df)
+                            
+                            progress = 30 + (40 * (idx + 1) / len(file_paths))
+                            self.run_in_main_thread(lambda *a, **k: self.progress_var.set(progress))
+                            
+                        except Exception as error:
+                            logging.error(f"Error processing file {file_path}: {str(error)}")
+                            print(f"DEBUG: file_path={file_path} (type={type(file_path)})")
+                            if not isinstance(file_path, str):
+                                file_path_str = str(file_path)
+                            else:
+                                file_path_str = file_path
+                            self.run_in_main_thread(
+                                lambda error=error, file_path_str=file_path_str, *a, **k: (
+                                    messagebox.showerror(
+                                        "Error",
+                                        f"Failed to process {os.path.basename(str(file_path_str)) if isinstance(file_path_str, (str, bytes, os.PathLike)) else file_path_str}: {str(error)}"
+                                    )
+                                ))
+                            continue
+                    
+                    if not dfs:
+                        self.run_in_main_thread(lambda *a, **k: messagebox.showerror("Error", "No valid data loaded"))
+                        self.run_in_main_thread(lambda *a, **k: self.progress_bar.pack_forget())
+                        return
+                    
+                    # Combine all dataframes
+                    data = pd.concat(dfs, ignore_index=True)
                 
                 # Apply date filtering if specified
                 start_date = self.start_date_entry.get()
